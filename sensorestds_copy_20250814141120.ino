@@ -24,9 +24,9 @@ OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature sensors(&oneWire);
 
 // ---- Calibração (seus dados experimentais) ----
-const int N_CAL = 7;
-float calibTDS[N_CAL]    = {103, 262, 429, 680, 888, 1038, 1084};
-float calibFactor[N_CAL] = {0.3678, 0.4295, 0.4290, 0.4755, 0.4852, 0.4532, 0.4059};
+const int N_CAL = 24;
+float calibTDS[N_CAL]    = {   103,  132  ,   146, ,     262,    429,    680,   854,      886,   898  ,     943  , 1003,  1036 ,  1039   , 1066  , 1084   , 1178    ,   1183,    1191, 1199   , 1210   , 1223   ,  1232   ,1235  , 1251  };
+float calibFactor[N_CAL] = {0.3678, 0.4125,0.4563, ,  0.4295, 0.4290, 0.4755, 0.4566, 0.47127, 0.4776 ,  0.5058  ,0.4327, 0.4465,  0.4478 , 0.4595 ,0.4059, 0.4315  , 0.4333,  0.4363, 0.4392 , 0.3878 , 0.3920 ,  0.3510 , 0.3519 , 0.3564 };
 
 // ---- Função para interpolar fator ----
 float getFactorFromTDS(float tds) {
