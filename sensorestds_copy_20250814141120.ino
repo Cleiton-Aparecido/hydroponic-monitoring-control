@@ -6,13 +6,12 @@
 // ---- LCD I2C ----
 #define I2C_SDA 21
 #define I2C_SCL 22
-// Endereço comum: 0x27 (se não aparecer nada, tente 0x3F)
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 
 // ---- TDS ----
-#define TdsSensorPin 34      // GPIO34 (ADC1_CH6)
-#define VREF 3.3             // Referência ADC ESP32
-#define SCOUNT 30            // Amostras p/ mediana
+#define TdsSensorPin 34
+#define VREF 3.3
+#define SCOUNT 30
 
 int   analogBuffer[SCOUNT];
 int   analogBufferTemp[SCOUNT];
@@ -20,10 +19,30 @@ int   analogBufferIndex = 0, copyIndex = 0;
 float averageVoltage = 0, tdsValue = 0;
 
 // ---- DS18B20 ----
-#define ONE_WIRE_BUS 4       // GPIO do DATA do DS18B20
+#define ONE_WIRE_BUS 4
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature sensors(&oneWire);
 
+// ---- Calibração (seus dados experimentais) ----
+const int N_CAL = 24;
+float calibTDS[N_CAL]    = {   103,  132  ,   146, ,     262,    429,    680,   854,      886,   898  ,     943  , 1003,  1036 ,  1039   , 1066  , 1084   , 1178    ,   1183,    1191, 1199   , 1210   , 1223   ,  1232   ,1235  , 1251  };
+float calibFactor[N_CAL] = {0.3678, 0.4125,0.4563, ,  0.4295, 0.4290, 0.4755, 0.4566, 0.47127, 0.4776 ,  0.5058  ,0.4327, 0.4465,  0.4478 , 0.4595 ,0.4059, 0.4315  , 0.4333,  0.4363, 0.4392 , 0.3878 , 0.3920 ,  0.3510 , 0.3519 , 0.3564 };
+
+// ---- Função para interpolar fator ----
+float getFactorFromTDS(float tds) {
+  if (tds <= calibTDS[0]) return calibFactor[0];
+  if (tds >= calibTDS[N_CAL - 1]) return calibFactor[N_CAL - 1];
+
+  for (int i = 0; i < N_CAL - 1; i++) {
+    if (tds >= calibTDS[i] && tds <= calibTDS[i + 1]) {
+      float t = (tds - calibTDS[i]) / (calibTDS[i + 1] - calibTDS[i]);
+      return calibFactor[i] + t * (calibFactor[i + 1] - calibFactor[i]);
+    }
+  }
+  return calibFactor[N_CAL - 1]; // fallback
+}
+
+// ---- Mediana ----
 int getMedianNum(int bArray[], int iFilterLen) {
   int bTab[iFilterLen];
   for (byte i = 0; i < iFilterLen; i++) bTab[i] = bArray[i];
@@ -45,7 +64,6 @@ void setup() {
   Serial.begin(115200);
   pinMode(TdsSensorPin, INPUT);
 
-  // I2C do LCD nos pinos estáveis do ESP32
   Wire.begin(I2C_SDA, I2C_SCL);
   lcd.init();
   lcd.backlight();
@@ -54,14 +72,13 @@ void setup() {
   lcd.setCursor(0, 1);
   lcd.print("Inicializando...");
   
-  // DS18B20
   sensors.begin();
   delay(1200);
   lcd.clear();
 }
 
 void loop() {
-  // --- Amostragem do ADC (a cada ~40 ms) ---
+  // --- Amostragem ---
   static unsigned long analogSampleTimepoint = millis();
   if (millis() - analogSampleTimepoint > 50U) {
     analogSampleTimepoint = millis();
@@ -70,111 +87,55 @@ void loop() {
     if (analogBufferIndex == SCOUNT) analogBufferIndex = 0;
   }
 
-  // --- Processamento/Exibição (a cada ~800 ms) ---
+  // --- Processamento ---
   static unsigned long printTimepoint = millis();
   if (millis() - printTimepoint > 1000U) {
     printTimepoint = millis();
 
-    // Copia e calcula mediana para reduzir ruído
+    // Mediana
     for (copyIndex = 0; copyIndex < SCOUNT; copyIndex++)
       analogBufferTemp[copyIndex] = analogBuffer[copyIndex];
     averageVoltage = getMedianNum(analogBufferTemp, SCOUNT) * VREF / 4095.0;
 
-    // Lê temperatura real do DS18B20
+    // Temperatura
     sensors.requestTemperatures();
     float temperatureC = sensors.getTempCByIndex(0);
     if (temperatureC == DEVICE_DISCONNECTED_C) {
-      temperatureC = 25.0; // fallback se sensor desconectado
+      temperatureC = 25.0;
     }
 
-    // Compensação de temperatura (ref 25°C)
+    // Compensação
     float compensationCoefficient = 1.0 + 0.02 * (temperatureC - 25.0);
     float compensationVoltage = averageVoltage / compensationCoefficient;
 
-    // Conversão para TDS (ppm) - curva do fabricante
+    // Conversão TDS
     tdsValue = (133.42 * pow(compensationVoltage, 3)
               - 255.86 * pow(compensationVoltage, 2)
               + 857.39 * compensationVoltage) * 0.5;
 
+    // Busca fator calibrado
+    float factor = getFactorFromTDS(tdsValue);
+
+    // EC final
+    float ecValue = tdsValue / (factor * 1000.0);
+
     // Serial
-    
     Serial.print("Temp: ");
     Serial.print(temperatureC, 2);
     Serial.print(" C | TDS: ");
     Serial.print((int)tdsValue);
-    Serial.println(" ppm");
-
-    float factor = 0.35; // ajuste se quiser 0.64 ou 0.7
-
-      if ((int)tdsValue > 80 && (int)tdsValue < 130){
-       Serial.print("calculo com fator 0,3678");
-       
-      factor = 0.3678;
-    }
-
-
-     if ((int)tdsValue > 240 && (int)tdsValue < 270){
-       Serial.print("calculo com fator 0,4295");
-       
-      factor = 0.4295;
-    }
-
-    if ((int)tdsValue > 390 && (int)tdsValue < 449){
-       Serial.print("calculo com fator 0,429");
-       
-      factor = 0.429;
-    }
-    if ((int)tdsValue > 600 && (int)tdsValue < 690){
-       Serial.print("calculo com fator 0,475");
-       
-      factor = 0.475;
-    }
-
-    if ((int)tdsValue > 810 && (int)tdsValue < 895){
-       Serial.print("calculo com fator 0,4852");
-       
-      factor = 0.4852;
-    }
-
-     if ((int)tdsValue > 1010 && (int)tdsValue < 1080){
-       Serial.print("calculo com fator 0,4532");
-       
-      factor = 0.4532;
-    }
-
-      if ((int)tdsValue > 1080 && (int)tdsValue < 1100){
-       Serial.print("calculo com fator 0,4059");
-       
-      factor = 0.4059;
-    }
-
-    float ecValue = tdsValue / (factor * 1000.0);
-
-  
-    Serial.print("Fator: ");
-    Serial.print(factor); 
-
-    Serial.print("EC Value: ");
-    Serial.print(ecValue, 2); // duas casas decimais
+    Serial.print(" ppm | Fator: ");
+    Serial.print(factor, 4);
+    Serial.print(" | EC: ");
+    Serial.print(ecValue, 3);
     Serial.println(" mS/cm");
 
-
-  // LCD CM
+    // LCD
     lcd.clear();
     lcd.setCursor(0, 0);
-    lcd.print("v: ");
-    lcd.print((float)ecValue);
+    lcd.print("EC: ");
+    lcd.print(ecValue, 2);
     lcd.print(" mS/cm");
-
-    // LCD tds
-    // lcd.clear();
-    // lcd.setCursor(0, 0);
-    // lcd.print("TDS:");
-    // lcd.print((int)tdsValue);
-    // lcd.print("ppm");
-
-
-
 
     lcd.setCursor(0, 1);
     lcd.print("Temp:");
