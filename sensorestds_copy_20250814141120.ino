@@ -1,84 +1,110 @@
-#include <Wire.h>
-#include <LiquidCrystal_I2C.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
+#include <LiquidCrystal_I2C.h>
 
-// ---- LCD I2C ----
-#define I2C_SDA 21
-#define I2C_SCL 22
-LiquidCrystal_I2C lcd(0x27, 16, 2);
+#define TdsSensorPin 34          // Pino do sensor de TDS/EC
+#define ONE_WIRE_BUS 4           // Pino do sensor DS18B20
+#define BOMB1_PIN 5              // Bomba 1
+#define BOMB2_PIN 18             // Bomba 2
+#define BOMB3_PIN 19             // Bomba 3
+#define CHECK_INTERVAL 60000     // Tempo entre verificações (ms)
+// #define CHECK_INTERVAL 2000   // Tempo entre verificações (ms)
+#define VREF 3.3                 // Referência ADC do ESP32
+#define SCOUNT 30                // Amostras de leitura analógica
+#define BOMB_FLOW 1.4286         // Vazão da bomba (mL/s)
 
-// ---- TDS ----
-#define TdsSensorPin 34
-#define VREF 3.3
-#define SCOUNT 30
 
-int   analogBuffer[SCOUNT];
-int   analogBufferTemp[SCOUNT];
-int   analogBufferIndex = 0, copyIndex = 0;
-float averageVoltage = 0, tdsValue = 0;
+// Botões (você pode trocar os pinos conforme sua ligação)
+#define BTN_UP_PIN 12
+#define BTN_DOWN_PIN 14
+#define BTN_OK_PIN 27
 
-// ---- DS18B20 ----
-#define ONE_WIRE_BUS 4
+// --- VARIÁVEIS GLOBAIS ---
+int analogBuffer[SCOUNT];
+int analogBufferTemp[SCOUNT];
+int analogBufferIndex = 0;
+float averageVoltage = 0;
+float tdsValue = 0;
+float ecValue = 0;
+bool editMode = false;
+float ecMin = 1.51;             // Valor mínimo de EC desejado
+bool bombActive = false;
+unsigned long startTimeBomb = 0;
+unsigned long lastCheck = 0;
+float tempo;
+
+
+// --- OBJETOS DOS SENSORES ---
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature sensors(&oneWire);
+LiquidCrystal_I2C lcd(0x27, 16, 2);
 
-// ---- Calibração (seus dados experimentais) ----
-const int N_CAL = 24;
-float calibTDS[N_CAL]    = {   103,  132  ,   146, ,     262,    429,    680,   854,      886,   898  ,     943  , 1003,  1036 ,  1039   , 1066  , 1084   , 1178    ,   1183,    1191, 1199   , 1210   , 1223   ,  1232   ,1235  , 1251  };
-float calibFactor[N_CAL] = {0.3678, 0.4125,0.4563, ,  0.4295, 0.4290, 0.4755, 0.4566, 0.47127, 0.4776 ,  0.5058  ,0.4327, 0.4465,  0.4478 , 0.4595 ,0.4059, 0.4315  , 0.4333,  0.4363, 0.4392 , 0.3878 , 0.3920 ,  0.3510 , 0.3519 , 0.3564 };
-
-// ---- Função para interpolar fator ----
-float getFactorFromTDS(float tds) {
-  if (tds <= calibTDS[0]) return calibFactor[0];
-  if (tds >= calibTDS[N_CAL - 1]) return calibFactor[N_CAL - 1];
-
-  for (int i = 0; i < N_CAL - 1; i++) {
-    if (tds >= calibTDS[i] && tds <= calibTDS[i + 1]) {
-      float t = (tds - calibTDS[i]) / (calibTDS[i + 1] - calibTDS[i]);
-      return calibFactor[i] + t * (calibFactor[i + 1] - calibFactor[i]);
-    }
-  }
-  return calibFactor[N_CAL - 1]; // fallback
-}
-
-// ---- Mediana ----
+// --- FUNÇÕES AUXILIARES ---
 int getMedianNum(int bArray[], int iFilterLen) {
   int bTab[iFilterLen];
-  for (byte i = 0; i < iFilterLen; i++) bTab[i] = bArray[i];
-
+  for (int i = 0; i < iFilterLen; i++) bTab[i] = bArray[i];
   for (int j = 0; j < iFilterLen - 1; j++) {
     for (int i = 0; i < iFilterLen - j - 1; i++) {
       if (bTab[i] > bTab[i + 1]) {
-        int bTemp = bTab[i];
+        int temp = bTab[i];
         bTab[i] = bTab[i + 1];
-        bTab[i + 1] = bTemp;
+        bTab[i + 1] = temp;
       }
     }
   }
-  if (iFilterLen & 1) return bTab[(iFilterLen - 1) / 2];
-  return (bTab[iFilterLen / 2] + bTab[iFilterLen / 2 - 1]) / 2;
+  if (iFilterLen & 1)
+    return bTab[(iFilterLen - 1) / 2];
+  else
+    return (bTab[iFilterLen / 2] + bTab[iFilterLen / 2 - 1]) / 2;
 }
 
+float getFactorFromTDS(float tds) {
+  // Fator aproximado para converter TDS -> EC
+  if (tds < 500) return 0.5;
+  if (tds < 1000) return 0.64;
+  return 0.7;
+}
+
+// --- Cálculo do volume (equação do professor) ---
+float calcularVolume(float ec) {
+  // Volume (mL) = 0,0507*EC² + 0,2745*EC + 0,0266
+  return 0.0507 * pow(ec, 2) + 0.2745 * ec + 0.0266;
+}
+
+
+float calcularTempoLigada(float ec) {
+  float diferenca = ecMin - ec; // quanto falta para o alvo
+  if (diferenca < 0) diferenca = 0; // evita valores negativos
+  float volume = 0.0507 * pow(diferenca, 2) + 0.2745 * diferenca + 0.0266;
+  return volume / BOMB_FLOW; // tempo em segundos
+}
+
+
+// --- SETUP ---
 void setup() {
   Serial.begin(115200);
-  pinMode(TdsSensorPin, INPUT);
+  pinMode(BOMB1_PIN, OUTPUT);
+  pinMode(BOMB2_PIN, OUTPUT);
+  pinMode(BOMB3_PIN, OUTPUT);
+  digitalWrite(BOMB1_PIN, LOW);
+  digitalWrite(BOMB2_PIN, LOW);
+  digitalWrite(BOMB3_PIN, LOW);
 
-  Wire.begin(I2C_SDA, I2C_SCL);
+  pinMode(BTN_UP_PIN, INPUT_PULLUP);
+  pinMode(BTN_DOWN_PIN, INPUT_PULLUP);
+  pinMode(BTN_OK_PIN, INPUT_PULLUP);
+
+  sensors.begin();
   lcd.init();
   lcd.backlight();
-  lcd.setCursor(0, 0);
-  lcd.print("TDS + Temp");
-  lcd.setCursor(0, 1);
-  lcd.print("Inicializando...");
-  
-  sensors.begin();
-  delay(1200);
-  lcd.clear();
+
+  Serial.println("Sistema de Controle de EC iniciado!");
+
 }
 
+// --- LOOP PRINCIPAL ---
 void loop() {
-  // --- Amostragem ---
+  // Amostragem do sensor de EC
   static unsigned long analogSampleTimepoint = millis();
   if (millis() - analogSampleTimepoint > 50U) {
     analogSampleTimepoint = millis();
@@ -87,60 +113,174 @@ void loop() {
     if (analogBufferIndex == SCOUNT) analogBufferIndex = 0;
   }
 
-  // --- Processamento ---
+
+   if (digitalRead(BTN_OK_PIN) == LOW) {
+    delay(200);
+    editMode = !editMode;
+    Serial.print("Modo alterado para: ");
+  }
+
+  if (editMode) {
+    if (digitalRead(BTN_UP_PIN) == LOW) {
+      ecMin += 0.01;
+      delay(200);
+    }
+    if (digitalRead(BTN_DOWN_PIN) == LOW) {
+      ecMin -= 0.01;
+      if (ecMin < 0) ecMin = 0;
+      delay(200);
+    }
+  }
+
+
+  // Processa e mostra resultados a cada 1 segundo
   static unsigned long printTimepoint = millis();
   if (millis() - printTimepoint > 1000U) {
     printTimepoint = millis();
 
-    // Mediana
-    for (copyIndex = 0; copyIndex < SCOUNT; copyIndex++)
-      analogBufferTemp[copyIndex] = analogBuffer[copyIndex];
+    for (int i = 0; i < SCOUNT; i++)
+      analogBufferTemp[i] = analogBuffer[i];
+
     averageVoltage = getMedianNum(analogBufferTemp, SCOUNT) * VREF / 4095.0;
 
-    // Temperatura
     sensors.requestTemperatures();
     float temperatureC = sensors.getTempCByIndex(0);
-    if (temperatureC == DEVICE_DISCONNECTED_C) {
-      temperatureC = 25.0;
-    }
+    if (temperatureC == DEVICE_DISCONNECTED_C) temperatureC = 25.0;
 
-    // Compensação
     float compensationCoefficient = 1.0 + 0.02 * (temperatureC - 25.0);
     float compensationVoltage = averageVoltage / compensationCoefficient;
 
-    // Conversão TDS
     tdsValue = (133.42 * pow(compensationVoltage, 3)
               - 255.86 * pow(compensationVoltage, 2)
               + 857.39 * compensationVoltage) * 0.5;
 
-    // Busca fator calibrado
     float factor = getFactorFromTDS(tdsValue);
+    ecValue = tdsValue / (factor * 1000.0);
 
-    // EC final
-    float ecValue = tdsValue / (factor * 1000.0);
+    // // --- Controle automático da bomba a cada 5 segundos ---
+      Serial.println("|==============================================|");
+      Serial.print("Segundos() -> ");
+      Serial.print(millis()/1000);
+      Serial.print("| bombActive() -> ");
+      Serial.println(bombActive);
+       Serial.println("|==============================================|");
+    if ((millis() - lastCheck > CHECK_INTERVAL) && bombActive == false ) {
 
-    // Serial
-    Serial.print("Temp: ");
-    Serial.print(temperatureC, 2);
-    Serial.print(" C | TDS: ");
-    Serial.print((int)tdsValue);
-    Serial.print(" ppm | Fator: ");
-    Serial.print(factor, 4);
-    Serial.print(" | EC: ");
-    Serial.print(ecValue, 3);
-    Serial.println(" mS/cm");
+      lastCheck = millis();
 
-    // LCD
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("EC: ");
-    lcd.print(ecValue, 2);
-    lcd.print(" mS/cm");
+      if ((ecValue < ecMin) && bombActive == false) {
+          Serial.println("=============ligar bombas=============");
+        tempo = calcularTempoLigada(ecValue); // segundos
+        Serial.print("EC baixo (");
+        Serial.print(ecValue);
+        Serial.print(" mS/cm). Ligando bomba por ");
+        Serial.print(tempo, 2);
+        Serial.println(" s...");
 
-    lcd.setCursor(0, 1);
-    lcd.print("Temp:");
-    lcd.print(temperatureC, 1);
-    lcd.print((char)223);
-    lcd.print("C");
+        startTimeBomb = millis();
+        bombActive = true;
+
+        digitalWrite(BOMB1_PIN, HIGH);
+        digitalWrite(BOMB2_PIN, HIGH);
+        digitalWrite(BOMB3_PIN, HIGH);
+
+
+    
+     
+
+      } else {
+        Serial.print("EC OK: ");
+        Serial.print(ecValue);
+        Serial.println(" mS/cm (bomba off)");
+      }
+       Serial.println("=============FINALIZADA Realizando analise=============");
+    }
+    
+    if(bombActive){
+        
+        
+        Serial.println("|==============================================|");
+        Serial.print("startTimeBomb: ");
+        Serial.println(startTimeBomb);
+
+        
+        Serial.print("lastCheck: ");
+        Serial.println(lastCheck);
+
+        Serial.print("millis() ");
+        Serial.println(millis());
+
+        Serial.print("tempo restante: ");
+        Serial.print( (millis() - startTimeBomb)/1000);
+        Serial.println( " seg");
+
+        Serial.print("Tempo ligada: ");
+        Serial.print((tempo * 100000)/1000);
+        Serial.println( " seg");
+
+      if(( millis() - startTimeBomb)  > (tempo * 100000) ){
+          Serial.print("Desativar bomba! "); 
+          
+
+          digitalWrite(BOMB1_PIN, LOW);
+          digitalWrite(BOMB2_PIN, LOW);
+          digitalWrite(BOMB3_PIN, LOW);
+
+          Serial.println("Bomba desligada.");
+          
+          bombActive = false;
+          lastCheck = millis();
+          
+        
+      }
+      else{
+           Serial.println("Bombas ligadas");
+      }
+
+
+    }else{
+       Serial.println("Bombas Desligadas");
+    }
+    
+    Serial.println("|==============================================|");
+
+    if(editMode){
+
+      lcd.setCursor(0, 0);
+      lcd.print("Modo altecao:  ");
+      lcd.setCursor(0, 1);
+      lcd.print(ecMin, 2);
+      lcd.print(" mS/cm     ");
+
+    }
+    else{
+        // --- Exibe informações no LCD ---
+        lcd.setCursor(0, 0);
+        lcd.print(ecValue, 2);
+        lcd.print(" mS/cm ");
+
+
+
+        if(bombActive){
+          lcd.setCursor(11, 0);
+          lcd.print("ON ");
+        }else{
+          lcd.setCursor(11, 0);
+          lcd.print("OFF ");
+        }
+
+        lcd.setCursor(0, 1);
+        lcd.print(temperatureC, 1);
+        lcd.print((char)223);
+        lcd.print("C");
+
+        lcd.setCursor(7, 1);
+        lcd.print("M:");
+        lcd.print(ecMin, 2);
+        lcd.print("ms");
+    }
+
+  
+
   }
 }
